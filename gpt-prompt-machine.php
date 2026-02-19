@@ -69,14 +69,28 @@ $DEFAULT_MODEL  = 'gpt-5-mini';
 */
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     @set_time_limit(120);
-    header('Content-Type: text/plain; charset=utf-8');
+
+    // text/event-stream is the strongest "don't buffer" signal for web servers & proxies
+    header('Content-Type: text/event-stream; charset=utf-8');
     header('X-Accel-Buffering: no');
     header('Cache-Control: no-cache');
+    header('Connection: keep-alive');
+    header('Content-Encoding: identity');
 
-    // Disable all output buffering so lines stream live
+    // Apache: disable mod_deflate/gzip which buffers the entire response
+    if (function_exists('apache_setenv')) {
+        @apache_setenv('no-gzip', '1');
+    }
+
+    // Disable all PHP output buffering
     while (ob_get_level()) ob_end_flush();
     @ini_set('output_buffering', 'off');
     @ini_set('zlib.output_compression', false);
+    ob_implicit_flush(1);
+
+    // Push past any remaining web-server buffer thresholds
+    echo str_repeat(' ', 8192) . "\n";
+    flush();
 
     $t0 = microtime(true);
     $ms = function() use ($t0) { return round((microtime(true) - $t0) * 1000) . 'ms'; };
@@ -84,7 +98,75 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     // Stream a log line to the client immediately
     function slog($ms, $msg, $type = 'info') {
         echo json_encode(['log' => true, 't' => $ms(), 'msg' => $msg, 'type' => $type]) . "\n";
+        if (ob_get_level()) @ob_flush();
         flush();
+    }
+
+    // Helper: streaming OpenAI request via SSE — keeps connection alive with heartbeats
+    function streamOpenAI($payload, $apiKey, $ms, $timeout = 120, $emitDeltas = false) {
+        $payload['stream'] = true;
+        $payload['stream_options'] = ['include_usage' => true];
+        $payloadJson = json_encode($payload);
+
+        $content       = '';
+        $usage         = null;
+        $finishReason  = 'unknown';
+        $modelUsed     = $payload['model'] ?? 'unknown';
+        $sseBuffer     = '';
+        $rawResponse   = '';
+
+        $ch = curl_init('https://api.openai.com/v1/chat/completions');
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => false,
+            CURLOPT_POST           => true,
+            CURLOPT_HTTPHEADER     => [
+                'Content-Type: application/json',
+                'Authorization: Bearer ' . $apiKey,
+            ],
+            CURLOPT_POSTFIELDS     => $payloadJson,
+            CURLOPT_TIMEOUT        => $timeout,
+            CURLOPT_CONNECTTIMEOUT => 10,
+            // Process SSE chunks as they arrive from OpenAI
+            CURLOPT_WRITEFUNCTION  => function($ch, $data) use (&$content, &$usage, &$finishReason, &$modelUsed, &$sseBuffer, &$rawResponse, $emitDeltas) {
+                $rawResponse .= $data;
+                $sseBuffer   .= $data;
+                $lines = explode("\n", $sseBuffer);
+                $sseBuffer = array_pop($lines);
+
+                foreach ($lines as $line) {
+                    $line = trim($line);
+                    if ($line === '' || $line === 'data: [DONE]') continue;
+                    if (strpos($line, 'data: ') !== 0) continue;
+
+                    $json = json_decode(substr($line, 6), true);
+                    if (!$json) continue;
+
+                    if (!empty($json['model']))                          $modelUsed = $json['model'];
+                    if (isset($json['choices'][0]['delta']['content'])) {
+                        $delta = $json['choices'][0]['delta']['content'];
+                        $content .= $delta;
+                        if ($emitDeltas) {
+                            echo json_encode(['delta' => $delta]) . "\n";
+                            if (ob_get_level()) @ob_flush();
+                            flush();
+                        }
+                    }
+                    if (!empty($json['choices'][0]['finish_reason']))     $finishReason = $json['choices'][0]['finish_reason'];
+                    if (!empty($json['usage']))                          $usage = $json['usage'];
+                }
+
+                return strlen($data);
+            },
+        ]);
+
+        slog($ms, 'cURL streaming request started...');
+        curl_exec($ch);
+        $httpCode  = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $curlError = curl_error($ch);
+        $curlInfo  = curl_getinfo($ch);
+        curl_close($ch);
+
+        return compact('content', 'usage', 'finishReason', 'modelUsed', 'httpCode', 'curlError', 'curlInfo', 'rawResponse');
     }
 
     slog($ms, 'POST received from ' . $_SERVER['REMOTE_ADDR']);
@@ -110,63 +192,91 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $promptLen = strlen($input['prompt']);
     slog($ms, 'Prompt parsed — ' . $promptLen . ' chars');
 
-    $payload = [
+    // Handle prompt modification
+    if (!empty($input['action']) && $input['action'] === 'modify') {
+        $instruction = $input['instruction'] ?? '';
+        if (empty($instruction)) {
+            slog($ms, 'ERROR: Missing modification instruction', 'err');
+            echo json_encode(['error' => 'Missing modification instruction']) . "\n";
+            exit;
+        }
+        slog($ms, 'Modification requested: "' . substr($instruction, 0, 80) . '"');
+
+        slog($ms, 'Sending streaming modification request...');
+
+        $result = streamOpenAI([
+            'model'    => $DEFAULT_MODEL,
+            'messages' => [
+                ['role' => 'system', 'content' => 'You are a prompt editor. You will receive a prompt and a modification instruction. Apply the modification to the prompt and return ONLY the modified prompt text. Do not add any explanations, commentary, markdown formatting, or code fences. Return the prompt exactly as it should be used.'],
+                ['role' => 'user', 'content' => "CURRENT PROMPT:\n" . $input['prompt'] . "\n\nMODIFICATION:\n" . $instruction],
+            ],
+        ], $OPENAI_API_KEY, $ms, 120, true);
+
+        $elapsed = round((microtime(true) - $t0) * 1000);
+        slog($ms, 'Stream complete — HTTP ' . $result['httpCode'] . ' — ' . strlen($result['content']) . ' chars');
+
+        if ($result['curlError']) {
+            slog($ms, 'cURL ERROR: ' . $result['curlError'], 'err');
+            echo json_encode(['error' => 'API request failed: ' . $result['curlError']]) . "\n";
+            exit;
+        }
+
+        if ($result['httpCode'] !== 200) {
+            $errData = json_decode($result['rawResponse'], true);
+            $msg = $errData['error']['message'] ?? 'OpenAI API error (HTTP ' . $result['httpCode'] . ')';
+            slog($ms, 'API ERROR: ' . $msg, 'err');
+            echo json_encode(['error' => $msg]) . "\n";
+            exit;
+        }
+
+        $modifiedPrompt = $result['content'];
+        $usage = $result['usage'];
+        if ($usage) {
+            slog($ms, 'Tokens — prompt: ' . ($usage['prompt_tokens'] ?? '?') . ' — completion: ' . ($usage['completion_tokens'] ?? '?'));
+        }
+        slog($ms, 'Prompt modified successfully — ' . strlen($modifiedPrompt) . ' chars', 'ok');
+
+        echo json_encode([
+            'action'     => 'modify',
+            'prompt'     => $modifiedPrompt,
+            'usage'      => $usage,
+            'elapsed_ms' => $elapsed,
+        ]) . "\n";
+        exit;
+    }
+
+    slog($ms, 'Sending streaming request — model: ' . $DEFAULT_MODEL);
+
+    $result = streamOpenAI([
         'model'    => $DEFAULT_MODEL,
         'messages' => [
             ['role' => 'user', 'content' => $input['prompt']],
         ],
-    ];
-
-    $payloadJson = json_encode($payload);
-    slog($ms, 'Payload built — model: ' . $DEFAULT_MODEL . ' — ' . strlen($payloadJson) . ' bytes');
-    slog($ms, 'Opening cURL to api.openai.com/v1/chat/completions');
-
-    $ch = curl_init('https://api.openai.com/v1/chat/completions');
-    curl_setopt_array($ch, [
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_POST           => true,
-        CURLOPT_HTTPHEADER     => [
-            'Content-Type: application/json',
-            'Authorization: Bearer ' . $OPENAI_API_KEY,
-        ],
-        CURLOPT_POSTFIELDS     => $payloadJson,
-        CURLOPT_TIMEOUT        => 60,
-    ]);
-
-    slog($ms, 'cURL configured — timeout: 60s — executing request...');
-    slog($ms, 'Waiting for OpenAI response...');
-
-    $response  = curl_exec($ch);
-    $httpCode  = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $curlError = curl_error($ch);
-    $curlInfo  = curl_getinfo($ch);
-    curl_close($ch);
+    ], $OPENAI_API_KEY, $ms, 120, true);
 
     $elapsed = round((microtime(true) - $t0) * 1000);
 
-    slog($ms, 'cURL complete — HTTP ' . $httpCode . ' — ' . strlen($response ?: '') . ' bytes received');
-    slog($ms, 'Timing — connect: ' . round(($curlInfo['connect_time'] ?? 0) * 1000) . 'ms — DNS: ' . round(($curlInfo['namelookup_time'] ?? 0) * 1000) . 'ms — total: ' . round(($curlInfo['total_time'] ?? 0) * 1000) . 'ms');
+    slog($ms, 'Stream complete — HTTP ' . $result['httpCode'] . ' — ' . strlen($result['content']) . ' chars');
+    slog($ms, 'Timing — connect: ' . round(($result['curlInfo']['connect_time'] ?? 0) * 1000) . 'ms — DNS: ' . round(($result['curlInfo']['namelookup_time'] ?? 0) * 1000) . 'ms — total: ' . round(($result['curlInfo']['total_time'] ?? 0) * 1000) . 'ms');
 
-    if ($curlError) {
-        slog($ms, 'cURL ERROR: ' . $curlError, 'err');
-        echo json_encode(['error' => 'API request failed: ' . $curlError, 'elapsed_ms' => $elapsed]) . "\n";
+    if ($result['curlError']) {
+        slog($ms, 'cURL ERROR: ' . $result['curlError'], 'err');
+        echo json_encode(['error' => 'API request failed: ' . $result['curlError'], 'elapsed_ms' => $elapsed]) . "\n";
         exit;
     }
 
-    $data = json_decode($response, true);
-    slog($ms, 'Response JSON decoded');
-
-    if ($httpCode !== 200) {
-        $msg = $data['error']['message'] ?? 'OpenAI API error (HTTP ' . $httpCode . ')';
-        slog($ms, 'API ERROR (HTTP ' . $httpCode . '): ' . $msg, 'err');
+    if ($result['httpCode'] !== 200) {
+        $errData = json_decode($result['rawResponse'], true);
+        $msg = $errData['error']['message'] ?? 'OpenAI API error (HTTP ' . $result['httpCode'] . ')';
+        slog($ms, 'API ERROR (HTTP ' . $result['httpCode'] . '): ' . $msg, 'err');
         echo json_encode(['error' => $msg, 'elapsed_ms' => $elapsed]) . "\n";
         exit;
     }
 
-    $content      = $data['choices'][0]['message']['content'] ?? '';
-    $finishReason = $data['choices'][0]['finish_reason'] ?? 'unknown';
-    $usage        = $data['usage'] ?? null;
-    $modelUsed    = $data['model'] ?? $DEFAULT_MODEL;
+    $content      = $result['content'];
+    $finishReason = $result['finishReason'];
+    $usage        = $result['usage'];
+    $modelUsed    = $result['modelUsed'];
 
     slog($ms, 'Model: ' . $modelUsed . ' — finish_reason: ' . $finishReason . ' — response: ' . strlen($content) . ' chars');
     if ($usage) {
@@ -209,6 +319,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 |--------------------------------------------------------------------------
 */
 $needsSetup = empty($OPENAI_API_KEY);
+
+// Prevent browser from caching the HTML page
+header('Cache-Control: no-cache, no-store, must-revalidate');
+header('Pragma: no-cache');
+header('Expires: 0');
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -230,19 +345,46 @@ $needsSetup = empty($OPENAI_API_KEY);
 
   .left { width: 50%; border-right: 1px solid #30363d; display: flex; flex-direction: column; }
   .left .panel-header { padding: 10px 16px; background: #161b22; border-bottom: 1px solid #30363d; font-size: 13px; font-weight: 600; color: #8b949e; text-transform: uppercase; letter-spacing: 0.5px; display: flex; justify-content: space-between; align-items: center; }
-  .left textarea { flex: 1; background: #0d1117; color: #c9d1d9; border: none; padding: 16px; font-family: 'SF Mono', 'Fira Code', monospace; font-size: 13px; line-height: 1.6; resize: none; outline: none; }
+  .prompt-wrap { position: relative; flex: 1; display: flex; overflow: hidden; }
+  .left textarea { flex: 1; width: 100%; background: #0d1117; color: #c9d1d9; border: none; padding: 16px; font-family: 'SF Mono', 'Fira Code', monospace; font-size: 13px; line-height: 1.6; resize: none; outline: none; }
+
+  /* Diff overlay */
+  .diff-overlay { position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: #0d1117; overflow-y: auto; padding: 16px; font-family: 'SF Mono', 'Fira Code', monospace; font-size: 13px; line-height: 1.6; z-index: 10; display: none; }
+  .diff-overlay.visible { display: block; }
+  .diff-banner { position: sticky; top: -16px; margin: -16px -16px 0 -16px; background: #161b22; border-bottom: 1px solid #30363d; padding: 10px 16px; font-size: 12px; color: #8b949e; z-index: 1; }
+  .diff-banner-top { display: flex; justify-content: space-between; align-items: center; }
+  .diff-banner-hint { font-size: 11px; color: #484f58; margin-top: 6px; line-height: 1.4; }
+  .diff-banner-btns { display: flex; gap: 6px; }
+  .btn-accept { background: #238636; color: #fff; border: none; border-radius: 4px; padding: 5px 14px; font-size: 11px; cursor: pointer; font-weight: 600; }
+  .btn-accept:hover { background: #2ea043; }
+  .btn-decline { background: #da3633; color: #fff; border: none; border-radius: 4px; padding: 5px 14px; font-size: 11px; cursor: pointer; font-weight: 600; }
+  .btn-decline:hover { background: #f85149; }
+  .diff-line { padding: 1px 8px; border-radius: 2px; white-space: pre-wrap; word-break: break-word; }
+  .diff-line.added { background: #1a3a2a; color: #3fb950; }
+  .diff-line.removed { background: #3a1a1a; color: #f85149; text-decoration: line-through; opacity: 0.6; }
+  .diff-line.same { color: #6e7681; }
 
   .chat-bar { display: flex; align-items: center; padding: 8px 12px; background: #0d1117; border-top: 1px solid #30363d; flex-shrink: 0; }
   .chat-bar-inner { display: flex; align-items: center; width: 100%; background: #1c2128; border: 1px solid #30363d; border-radius: 20px; padding: 4px 4px 4px 16px; }
   .chat-bar-label { flex: 1; font-size: 13px; color: #484f58; user-select: none; }
   .chat-bar-label.active { color: #8b949e; }
-  .btn-send { width: 32px; height: 32px; border-radius: 50%; background: #238636; color: #fff; border: none; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: background 0.15s; flex-shrink: 0; }
+  .btn-send { height: 32px; border-radius: 16px; background: #238636; color: #fff; border: none; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 6px; padding: 0 14px; font-size: 12px; font-weight: 600; transition: background 0.15s; flex-shrink: 0; white-space: nowrap; }
   .btn-send:hover { background: #2ea043; }
   .btn-send:disabled { background: #30363d; color: #484f58; cursor: not-allowed; }
-  .btn-send svg { width: 16px; height: 16px; fill: currentColor; }
-  .btn-stop-pill { width: 32px; height: 32px; border-radius: 50%; background: #da3633; color: #fff; border: none; cursor: pointer; display: none; align-items: center; justify-content: center; transition: background 0.15s; flex-shrink: 0; }
+  .btn-send svg { width: 14px; height: 14px; fill: currentColor; }
+  .btn-stop-pill { height: 32px; border-radius: 16px; background: #da3633; color: #fff; border: none; cursor: pointer; display: none; align-items: center; justify-content: center; gap: 6px; padding: 0 14px; font-size: 12px; font-weight: 600; transition: background 0.15s; flex-shrink: 0; white-space: nowrap; }
   .btn-stop-pill:hover { background: #f85149; }
   .btn-stop-pill svg { width: 14px; height: 14px; fill: currentColor; }
+
+  /* Modify bar */
+  .modify-bar { display: flex; align-items: center; padding: 8px 12px; background: #0d1117; border-top: 1px solid #30363d; flex-shrink: 0; }
+  .modify-bar-inner { display: flex; align-items: center; width: 100%; background: #1c2128; border: 1px solid #30363d; border-radius: 20px; padding: 4px 4px 4px 16px; gap: 4px; }
+  .modify-bar-inner input { flex: 1; background: transparent; border: none; color: #c9d1d9; font-size: 13px; outline: none; min-width: 0; }
+  .modify-bar-inner input::placeholder { color: #484f58; }
+  .btn-modify { height: 32px; border-radius: 16px; background: #8957e5; color: #fff; border: none; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 6px; padding: 0 14px; font-size: 12px; font-weight: 600; transition: background 0.15s; flex-shrink: 0; white-space: nowrap; }
+  .btn-modify:hover { background: #a371f7; }
+  .btn-modify:disabled { background: #30363d; color: #484f58; cursor: not-allowed; }
+  .btn-modify svg { width: 14px; height: 14px; fill: currentColor; }
 
   .right { width: 50%; display: flex; flex-direction: column; }
   .right .panel-header { padding: 10px 16px; background: #161b22; border-bottom: 1px solid #30363d; font-size: 13px; font-weight: 600; color: #8b949e; text-transform: uppercase; letter-spacing: 0.5px; display: flex; justify-content: space-between; align-items: center; }
@@ -328,7 +470,9 @@ $needsSetup = empty($OPENAI_API_KEY);
   <div class="left">
     <div class="panel-header">
       Instructions / Prompt
+      <span style="font-size:11px;font-weight:400;color:#484f58;text-transform:none;letter-spacing:0;">Edit directly or use Modify below</span>
     </div>
+    <div class="prompt-wrap">
     <textarea id="promptInput" spellcheck="false"><?php echo htmlspecialchars('You are to return valid JSON in the following structure and follow all instructions carefully.
 
 STRUCTURE:
@@ -376,13 +520,22 @@ STRICTLY DO NOT USE:
 
 RETURN:
 Only valid JSON in the defined structure above. No markdown, no explanations, no formatting extras.'); ?></textarea>
+    <div class="diff-overlay" id="diffOverlay"></div>
+    </div>
+    <div class="modify-bar">
+      <div class="modify-bar-inner">
+        <input type="text" id="modifyInput" placeholder="e.g. make this more professional, add a new rule..." />
+        <button class="btn-modify" id="btnModify" title="AI rewrites your prompt based on your instruction. Changes shown as a diff: green = added, red = removed. Your prompt is updated automatically.">Modify<svg viewBox="0 0 24 24"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1 1 0 000-1.41l-2.34-2.34a1 1 0 00-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/></svg></button>
+      </div>
+    </div>
   </div>
 
   <div class="right">
     <div class="panel-header">
-      <div style="display:flex;align-items:center;">
+      <div style="display:flex;align-items:center;gap:8px;">
         Output
-        <span style="font-size:12px;color:#8b949e;margin-left:8px;" id="historyCount"></span>
+        <span style="font-size:12px;color:#8b949e;" id="historyCount"></span>
+        <span style="font-size:11px;font-weight:400;color:#484f58;text-transform:none;letter-spacing:0;">Uses the latest prompt from the left panel</span>
       </div>
       <div style="display:flex;align-items:center;gap:8px;">
         <div class="tabs">
@@ -398,8 +551,8 @@ Only valid JSON in the defined structure above. No markdown, no explanations, no
     <div class="chat-bar">
       <div class="chat-bar-inner">
         <span class="chat-bar-label" id="chatBarLabel">Press enter or click to generate</span>
-        <button class="btn-stop-pill" id="btnStop" title="Stop"><svg viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></svg></button>
-        <button class="btn-send" id="btnGenerate" title="Generate"><svg viewBox="0 0 24 24"><path d="M3 20l18-8L3 4v6.27L14 12 3 13.73z"/></svg></button>
+        <button class="btn-stop-pill" id="btnStop" title="Cancel the current generation">Stop<svg viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></svg></button>
+        <button class="btn-send" id="btnGenerate" title="Runs the current prompt on the left to generate output. Only uses the latest version of your prompt (green changes are already applied).">Generate<svg viewBox="0 0 24 24"><path d="M3 20l18-8L3 4v6.27L14 12 3 13.73z"/></svg></button>
       </div>
     </div>
   </div>
@@ -438,6 +591,95 @@ const logCount     = document.getElementById('logCount');
 let currentView = 'preview';
 let history = [];
 let generationCount = 0;
+const modifyInput   = document.getElementById('modifyInput');
+const btnModify     = document.getElementById('btnModify');
+let isModifying = false;
+const diffOverlay   = document.getElementById('diffOverlay');
+let promptHistory = [];
+
+// --- Line diff (LCS-based) ---
+function diffLines(oldText, newText) {
+  const oldL = oldText.split('\n');
+  const newL = newText.split('\n');
+  const m = oldL.length, n = newL.length;
+  const dp = [];
+  for (let i = 0; i <= m; i++) {
+    dp[i] = new Array(n + 1).fill(0);
+  }
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      if (oldL[i-1] === newL[j-1]) dp[i][j] = dp[i-1][j-1] + 1;
+      else dp[i][j] = Math.max(dp[i-1][j], dp[i][j-1]);
+    }
+  }
+  const result = [];
+  let i = m, j = n;
+  while (i > 0 || j > 0) {
+    if (i > 0 && j > 0 && oldL[i-1] === newL[j-1]) {
+      result.unshift({ text: oldL[i-1], type: 'same' });
+      i--; j--;
+    } else if (j > 0 && (i === 0 || dp[i][j-1] >= dp[i-1][j])) {
+      result.unshift({ text: newL[j-1], type: 'added' });
+      j--;
+    } else {
+      result.unshift({ text: oldL[i-1], type: 'removed' });
+      i--;
+    }
+  }
+  return result;
+}
+
+function showDiff(oldText, newText) {
+  const diff = diffLines(oldText, newText);
+  const revLabel = promptHistory.length > 1
+    ? ' (revision ' + promptHistory.length + ' — ' + promptHistory.length + ' undo step' + (promptHistory.length > 1 ? 's' : '') + ' available)'
+    : '';
+  let html = '<div class="diff-banner">'
+    + '<div class="diff-banner-top">'
+    + '<span>Review changes' + revLabel + '</span>'
+    + '<div class="diff-banner-btns">'
+    + '<button class="btn-decline" onclick="declineDiff()">Decline</button>'
+    + '<button class="btn-accept" onclick="acceptDiff()">Accept</button>'
+    + '</div>'
+    + '</div>'
+    + '<div class="diff-banner-hint">Tip: You can press Generate on the right to preview the output before accepting or declining.</div>'
+    + '</div>';
+  for (const d of diff) {
+    const prefix = d.type === 'added' ? '+ ' : d.type === 'removed' ? '- ' : '  ';
+    html += '<div class="diff-line ' + d.type + '">' + prefix + escapeHtml(d.text) + '</div>';
+  }
+  diffOverlay.innerHTML = html;
+  diffOverlay.classList.add('visible');
+}
+
+function acceptDiff() {
+  promptHistory = [];
+  diffOverlay.classList.remove('visible');
+  diffOverlay.innerHTML = '';
+  addLogEntry('Prompt changes accepted — history cleared', 'ok');
+}
+
+function declineDiff() {
+  if (promptHistory.length > 0) {
+    const reverted = promptHistory.pop();
+    promptInput.value = reverted;
+    addLogEntry('Prompt changes declined — reverted to previous version (' + promptHistory.length + ' step' + (promptHistory.length !== 1 ? 's' : '') + ' remaining)', 'warn');
+
+    if (promptHistory.length > 0) {
+      // Still have unaccepted history — re-show diff from previous level
+      showDiff(promptHistory[promptHistory.length - 1], reverted);
+    } else {
+      // Back to original baseline — clear everything
+      diffOverlay.classList.remove('visible');
+      diffOverlay.innerHTML = '';
+    }
+  }
+}
+
+function dismissDiff() {
+  diffOverlay.classList.remove('visible');
+  diffOverlay.innerHTML = '';
+}
 
 function addLogEntry(msg, type = 'info') {
   const empty = logEntries.querySelector('.log-empty');
@@ -450,6 +692,7 @@ function addLogEntry(msg, type = 'info') {
   el.innerHTML = '<span class="log-time">' + ts + '</span><span class="' + cls + '">' + escapeHtml(msg) + '</span>';
   logEntries.appendChild(el);
   logEntries.scrollTop = logEntries.scrollHeight;
+  return el;
 }
 
 function addServerLog(entry) {
@@ -458,22 +701,31 @@ function addServerLog(entry) {
 }
 
 // Read a streaming response line by line, calling onLine for each
-async function readStream(response, onLine) {
+async function readStream(response, onLine, signal) {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split('\n');
-    buffer = lines.pop(); // keep incomplete last line in buffer
-    for (const line of lines) {
-      if (line.trim()) onLine(line.trim());
-    }
+
+  // When abort fires, cancel the reader so reader.read() rejects immediately
+  if (signal) {
+    signal.addEventListener('abort', () => reader.cancel(), { once: true });
   }
-  // flush remaining
-  if (buffer.trim()) onLine(buffer.trim());
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+      for (const line of lines) {
+        if (line.trim()) onLine(line.trim());
+      }
+    }
+    if (buffer.trim()) onLine(buffer.trim());
+  } catch (e) {
+    // Reader was cancelled by abort — this is expected
+  }
 }
 
 // --- Tabs: re-render all bubbles when switching view ---
@@ -496,6 +748,9 @@ btnClear.addEventListener('click', () => {
 
 let isGenerating = false;
 let abortController = null;
+const MAX_RETRIES = 5;
+const RETRY_DELAY_MS = 3000;
+function wait(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 btnGenerate.addEventListener('click', generate);
 btnStop.addEventListener('click', stopGenerating);
@@ -522,6 +777,149 @@ function stopGenerating() {
   logStatus.innerHTML = 'Status: <span class="val">Ready</span>';
 }
 
+// --- Prompt Modification ---
+btnModify.addEventListener('click', modifyPrompt);
+modifyInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    if (!isModifying) modifyPrompt();
+  }
+});
+
+let modifyAbort = null;
+
+async function modifyPrompt() {
+  const instruction = modifyInput.value.trim();
+  const currentPrompt = promptInput.value.trim();
+  if (!instruction || !currentPrompt) return;
+
+  promptHistory.push(currentPrompt);
+  dismissDiff();
+  const oldPrompt = currentPrompt;
+  isModifying = true;
+  modifyAbort = new AbortController();
+  btnModify.disabled = true;
+  btnModify.innerHTML = '<span class="spinner"></span><span class="modify-text">Modifying...</span>';
+  modifyInput.disabled = true;
+  logStatus.innerHTML = 'Status: <span class="val-yellow">Modifying prompt...</span>';
+  addLogEntry('Modifying prompt: "' + instruction + '"');
+
+  // Client-side progress timer — updates a single log line in place
+  const modStart = Date.now();
+  const modLogEl = addLogEntry('Modifying prompt... (0s)');
+  let modTimer = setInterval(() => {
+    const elapsed = Math.round((Date.now() - modStart) / 1000);
+    modLogEl.querySelector('span:last-child').textContent = 'Modifying prompt... (' + elapsed + 's)';
+    const mt = btnModify.querySelector('.modify-text');
+    if (mt) mt.textContent = 'Modifying... (' + elapsed + 's)';
+  }, 1000);
+
+  let attempt = 0;
+  while (isModifying) {
+    attempt++;
+    try {
+      const res = await fetch(window.location.href, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt: currentPrompt, instruction: instruction, action: 'modify' }),
+        signal: modifyAbort.signal,
+      });
+
+      // Check for gateway timeout / non-streaming response
+      const ct = res.headers.get('content-type') || '';
+      if (!ct.includes('text/event-stream')) {
+        await res.text();
+        if (attempt >= MAX_RETRIES) {
+          addLogEntry('Modify gave up after ' + attempt + ' attempts — server keeps timing out.', 'err');
+          logStatus.innerHTML = 'Status: <span class="val-red">Server timeout</span>';
+          promptHistory.pop(); // undo the history push since modification failed
+          break;
+        }
+        addLogEntry('Modify attempt ' + attempt + '/' + MAX_RETRIES + ' — gateway timeout (HTTP ' + res.status + '), retrying in ' + (RETRY_DELAY_MS/1000) + 's...', 'warn');
+        { const mt = btnModify.querySelector('.modify-text'); if (mt) mt.textContent = 'Retrying (' + (attempt+1) + '/' + MAX_RETRIES + ')...'; }
+        await wait(RETRY_DELAY_MS);
+        continue;
+      }
+
+      let data = null;
+      let modifyStreamedChars = 0;
+      await readStream(res, (line) => {
+        let obj;
+        try { obj = JSON.parse(line); } catch (e) { return; }
+        if (obj.log) {
+          addServerLog(obj);
+        } else if (obj.delta !== undefined) {
+          modifyStreamedChars += obj.delta.length;
+          const mt = btnModify.querySelector('.modify-text');
+          if (mt) mt.textContent = 'Streaming (' + modifyStreamedChars + ' chars)...';
+        } else {
+          data = obj;
+        }
+      }, modifyAbort.signal);
+
+      if (!data) {
+        if (attempt >= MAX_RETRIES) {
+          addLogEntry('Modify gave up after ' + attempt + ' attempts — empty responses.', 'err');
+          logStatus.innerHTML = 'Status: <span class="val-red">Failed</span>';
+          promptHistory.pop();
+          break;
+        }
+        addLogEntry('Modify attempt ' + attempt + '/' + MAX_RETRIES + ' — empty response, retrying in ' + (RETRY_DELAY_MS/1000) + 's...', 'warn');
+        { const mt = btnModify.querySelector('.modify-text'); if (mt) mt.textContent = 'Retrying (' + (attempt+1) + '/' + MAX_RETRIES + ')...'; }
+        await wait(RETRY_DELAY_MS);
+        continue;
+      }
+
+      if (data.error) {
+        addLogEntry('Modification error: ' + data.error, 'err');
+        logStatus.innerHTML = 'Status: <span class="val-red">Error</span>';
+        promptHistory.pop();
+        break;
+      }
+
+      if (data.prompt) {
+        promptInput.value = data.prompt;
+        showDiff(oldPrompt, data.prompt);
+        addLogEntry('Prompt modified successfully' + (attempt > 1 ? ' (attempt ' + attempt + ')' : ''), 'ok');
+        logStatus.innerHTML = 'Status: <span class="val-green">Prompt updated</span>';
+        modifyInput.value = '';
+        if (data.usage) {
+          const tokIn  = data.usage.prompt_tokens || '?';
+          const tokOut = data.usage.completion_tokens || '?';
+          logTokens.innerHTML = 'Tokens: <span class="val">' + tokIn + ' in / ' + tokOut + ' out</span>';
+        }
+        if (data.elapsed_ms) logTime.innerHTML = 'Time: <span class="val">' + data.elapsed_ms + 'ms</span>';
+      }
+      break;
+
+    } catch (err) {
+      if (err.name === 'AbortError') {
+        addLogEntry('Modification cancelled', 'warn');
+        promptHistory.pop();
+        break;
+      }
+      if (attempt >= MAX_RETRIES) {
+        addLogEntry('Modify gave up after ' + attempt + ' attempts — ' + err.message, 'err');
+        logStatus.innerHTML = 'Status: <span class="val-red">Failed</span>';
+        promptHistory.pop();
+        break;
+      }
+      addLogEntry('Modify attempt ' + attempt + '/' + MAX_RETRIES + ' — network error: ' + err.message + ', retrying in ' + (RETRY_DELAY_MS/1000) + 's...', 'warn');
+      { const mt = btnModify.querySelector('.modify-text'); if (mt) mt.textContent = 'Retrying (' + (attempt+1) + '/' + MAX_RETRIES + ')...'; }
+      await wait(RETRY_DELAY_MS);
+      continue;
+    }
+  }
+
+  clearInterval(modTimer);
+  modifyAbort = null;
+  isModifying = false;
+  btnModify.disabled = false;
+  btnModify.innerHTML = 'Modify<svg viewBox="0 0 24 24"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1 1 0 000-1.41l-2.34-2.34a1 1 0 00-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/></svg>';
+  modifyInput.disabled = false;
+  modifyInput.focus();
+}
+
 async function generate() {
   const prompt = promptInput.value.trim();
   if (!prompt) return;
@@ -545,12 +943,22 @@ async function generate() {
   // Loading bubble
   const loadingRow = document.createElement('div');
   loadingRow.className = 'chat-row assistant';
-  loadingRow.innerHTML = '<div class="bubble"><div class="bubble-loading"><span class="spinner"></span> Generating response...</div></div>';
+  loadingRow.innerHTML = '<div class="bubble"><div class="bubble-loading"><span class="spinner"></span> <span class="loading-text">Generating response...</span></div></div>';
   outputArea.appendChild(loadingRow);
   outputArea.scrollTop = outputArea.scrollHeight;
 
   logStatus.innerHTML = 'Status: <span class="val-yellow">Generating...</span>';
   addLogEntry('Sending request to OpenAI (' + prompt.length + ' chars)');
+
+  // Client-side progress timer — updates a single log line in place
+  const genStart = Date.now();
+  const genLogEl = addLogEntry('Waiting for OpenAI... (0s)');
+  let genTimer = setInterval(() => {
+    const elapsed = Math.round((Date.now() - genStart) / 1000);
+    genLogEl.querySelector('span:last-child').textContent = 'Waiting for OpenAI... (' + elapsed + 's)';
+    const el = loadingRow.querySelector('.loading-text');
+    if (el) el.textContent = 'Generating response... (' + elapsed + 's)';
+  }, 1000);
 
   let attempt = 0;
   while (isGenerating) {
@@ -565,32 +973,55 @@ async function generate() {
 
       // Check if we got a non-streaming response (e.g. 504 HTML page)
       const ct = res.headers.get('content-type') || '';
-      if (!ct.includes('text/plain')) {
-        const text = await res.text();
-        addLogEntry('Attempt ' + attempt + ' — gateway timeout (HTTP ' + res.status + '), retrying...', 'warn');
+      if (!ct.includes('text/event-stream')) {
+        await res.text();
+        if (attempt >= MAX_RETRIES) {
+          addLogEntry('Gave up after ' + attempt + ' attempts — server keeps timing out. Your hosting provider may have a short timeout limit.', 'err');
+          logStatus.innerHTML = 'Status: <span class="val-red">Server timeout</span>';
+          loadingRow.remove();
+          appendErrorBubble('Server timed out after ' + attempt + ' attempts (HTTP ' + res.status + '). Your web server cuts the connection before OpenAI responds. Try a shorter prompt or check your hosting timeout settings.');
+          break;
+        }
+        addLogEntry('Attempt ' + attempt + '/' + MAX_RETRIES + ' — gateway timeout (HTTP ' + res.status + '), retrying in ' + (RETRY_DELAY_MS/1000) + 's...', 'warn');
         logStatus.innerHTML = 'Status: <span class="val-yellow">Timed out, retrying...</span>';
-        chatBarLabel.textContent = 'Timed out — retrying (attempt ' + attempt + ')...';
-        loadingRow.querySelector('.bubble-loading').innerHTML = '<span class="spinner"></span> Timed out — retrying (attempt ' + attempt + ')...';
+        chatBarLabel.textContent = 'Timed out — retrying (attempt ' + (attempt+1) + '/' + MAX_RETRIES + ')...';
+        const ltEl1 = loadingRow.querySelector('.loading-text');
+        if (ltEl1) ltEl1.textContent = 'Timed out — retrying in ' + (RETRY_DELAY_MS/1000) + 's (attempt ' + (attempt+1) + '/' + MAX_RETRIES + ')...';
+        await wait(RETRY_DELAY_MS);
         continue;
       }
 
       // Stream the response line by line
       let data = null;
+      let streamedChars = 0;
       await readStream(res, (line) => {
         let obj;
         try { obj = JSON.parse(line); } catch (e) { return; }
         if (obj.log) {
           addServerLog(obj);
+        } else if (obj.delta !== undefined) {
+          streamedChars += obj.delta.length;
+          const el = loadingRow.querySelector('.loading-text');
+          if (el) el.textContent = 'Streaming response... (' + streamedChars + ' chars)';
         } else {
           data = obj;
         }
-      });
+      }, abortController.signal);
 
       if (!data) {
-        addLogEntry('Attempt ' + attempt + ' — empty response from server, retrying...', 'warn');
+        if (attempt >= MAX_RETRIES) {
+          addLogEntry('Gave up after ' + attempt + ' attempts — server returned empty responses.', 'err');
+          logStatus.innerHTML = 'Status: <span class="val-red">Failed</span>';
+          loadingRow.remove();
+          appendErrorBubble('Server returned empty responses after ' + attempt + ' attempts. Your web server may be killing long-running requests.');
+          break;
+        }
+        addLogEntry('Attempt ' + attempt + '/' + MAX_RETRIES + ' — empty response, retrying in ' + (RETRY_DELAY_MS/1000) + 's...', 'warn');
         logStatus.innerHTML = 'Status: <span class="val-yellow">Empty response, retrying...</span>';
-        chatBarLabel.textContent = 'Empty response — retrying (attempt ' + attempt + ')...';
-        loadingRow.querySelector('.bubble-loading').innerHTML = '<span class="spinner"></span> Empty response — retrying (attempt ' + attempt + ')...';
+        chatBarLabel.textContent = 'Empty response — retrying (attempt ' + (attempt+1) + '/' + MAX_RETRIES + ')...';
+        const ltEl2 = loadingRow.querySelector('.loading-text');
+        if (ltEl2) ltEl2.textContent = 'Empty response — retrying in ' + (RETRY_DELAY_MS/1000) + 's (attempt ' + (attempt+1) + '/' + MAX_RETRIES + ')...';
+        await wait(RETRY_DELAY_MS);
         continue;
       }
 
@@ -638,14 +1069,24 @@ async function generate() {
         loadingRow.remove();
         break;
       }
-      addLogEntry('Attempt ' + attempt + ' — network error: ' + err.message + ', retrying...', 'warn');
+      if (attempt >= MAX_RETRIES) {
+        addLogEntry('Gave up after ' + attempt + ' attempts — ' + err.message, 'err');
+        logStatus.innerHTML = 'Status: <span class="val-red">Failed</span>';
+        loadingRow.remove();
+        appendErrorBubble('Network error after ' + attempt + ' attempts: ' + err.message);
+        break;
+      }
+      addLogEntry('Attempt ' + attempt + '/' + MAX_RETRIES + ' — network error: ' + err.message + ', retrying in ' + (RETRY_DELAY_MS/1000) + 's...', 'warn');
       logStatus.innerHTML = 'Status: <span class="val-yellow">Connection error, retrying...</span>';
-      chatBarLabel.textContent = 'Connection error — retrying (attempt ' + attempt + ')...';
-      loadingRow.querySelector('.bubble-loading').innerHTML = '<span class="spinner"></span> Connection error — retrying (attempt ' + attempt + ')...';
+      chatBarLabel.textContent = 'Connection error — retrying (attempt ' + (attempt+1) + '/' + MAX_RETRIES + ')...';
+      const ltEl3 = loadingRow.querySelector('.loading-text');
+      if (ltEl3) ltEl3.textContent = 'Connection error — retrying in ' + (RETRY_DELAY_MS/1000) + 's (attempt ' + (attempt+1) + '/' + MAX_RETRIES + ')...';
+      await wait(RETRY_DELAY_MS);
       continue;
     }
   }
 
+  clearInterval(genTimer);
   abortController = null;
   setRunning(false);
 }
